@@ -340,7 +340,7 @@ On a modern CPU after model warmup:
 
 1. **~80% accuracy on diverse content:** The embedding-only approach has a ceiling. For critical applications, consider a two-stage filter: FastMemory as first pass, small LLM for ambiguous cases near the threshold.
 
-2. **Runtime support:** Works with both Bun (native SQLite) and Node.js (better-sqlite3).
+2. **Runtime support:** Requires Bun (uses native SQLite).
 
 3. **Model download:** First run downloads ~1.2GB. Cached after that.
 

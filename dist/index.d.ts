@@ -7,6 +7,7 @@ export interface MemoryEntry {
 }
 export interface AgentMemoryConfig {
     dbPath: string;
+    cacheDir?: string;
 }
 export declare function createAgentMemory(config: AgentMemoryConfig): Promise<{
     add: (content: string, metadata?: Record<string, any>) => Promise<`${string}-${string}-${string}-${string}-${string}`>;

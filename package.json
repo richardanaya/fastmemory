@@ -38,9 +38,6 @@
   "dependencies": {
     "fastembed": "^2.1.0"
   },
-  "optionalDependencies": {
-    "better-sqlite3": "^11.0.0"
-  },
   "files": [
     "dist",
     "MEMORY_RESEARCH.md",
@@ -52,7 +49,6 @@
     "test": "npm run build && node test-runtime.mjs && bun test-runtime.mjs"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
     "@types/bun": "^1.3.9",
     "@types/node": "^25.2.3",
     "typescript": "^5.9.3"

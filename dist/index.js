@@ -4,7 +4,6 @@ import { FlagEmbedding, EmbeddingModel } from 'fastembed';
 async function createDatabase(dbPath) {
     const isBun = typeof Bun !== 'undefined';
     if (isBun) {
-        // Use Bun's native SQLite
         const { Database } = await import('bun:sqlite');
         const db = new Database(dbPath, { create: true, readwrite: true });
         db.run('PRAGMA journal_mode = WAL');
@@ -21,35 +20,29 @@ async function createDatabase(dbPath) {
         };
     }
     else {
-        // Use better-sqlite3 for Node.js
-        const Database = (await import('better-sqlite3')).default;
-        const db = new Database(dbPath);
-        db.pragma('journal_mode = WAL');
-        return {
-            run: (sql, params) => {
-                const stmt = db.prepare(sql);
-                return params ? stmt.run(...params) : stmt.run();
-            },
-            query: (sql) => {
-                const stmt = db.prepare(sql);
-                return {
-                    all: (...params) => stmt.all(...params),
-                    get: (...params) => stmt.get(...params)
-                };
-            },
-            close: () => db.close()
-        };
+        throw new Error('fastmemory requires Bun. Node.js is not supported.');
     }
 }
-let embedder;
-async function initEmbedder() {
-    if (!embedder) {
-        embedder = await FlagEmbedding.init({
-            model: EmbeddingModel.BGEBaseENV15,
-        });
+// ── Fastembed with cacheDir support ──
+let embedder = null;
+let initializedCacheDir = null;
+async function initEmbedder(cacheDir) {
+    if (embedder) {
+        if (cacheDir && initializedCacheDir && cacheDir !== initializedCacheDir) {
+            console.warn(`[fastmemory] cacheDir changed after initialization. Using original: ${initializedCacheDir}`);
+        }
+        return;
     }
+    const options = {
+        model: EmbeddingModel.BGEBaseENV15,
+    };
+    if (cacheDir) {
+        options.cacheDir = cacheDir;
+        initializedCacheDir = cacheDir;
+    }
+    embedder = await FlagEmbedding.init(options);
 }
-// --- Dual-prototype memory judge ---
+// --- Dual-prototype memory judge --- (unchanged)
 const POSITIVE_PROTOTYPES = [
     "user permanently prefers specific tools languages frameworks themes and hates specific alternatives for all future work",
     "user personal identity: name birthday allergy disability pronouns timezone contact email credential",
@@ -104,14 +97,6 @@ function cosineSim(a, b) {
     }
     return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1);
 }
-/**
- * Computes the importance gap: max similarity to positive prototypes
- * minus average of top-2 negative prototype similarities.
- *
- * Using avg top-2 neg instead of max neg improves precision (fewer false
- * positives) because a single high neg match can be an outlier -- averaging
- * the top 2 gives a more stable estimate of "throwaway-ness".
- */
 async function getImportanceGap(content) {
     await initPrototypes();
     const qEmb = await embedder.queryEmbed(content);
@@ -121,8 +106,7 @@ async function getImportanceGap(content) {
     return posSim - avgTop2Neg;
 }
 export async function createAgentMemory(config) {
-    await initEmbedder();
-    // Create database using appropriate adapter (Bun or Node.js)
+    await initEmbedder(config.cacheDir); // ← Now respects cacheDir
     const db = await createDatabase(config.dbPath);
     // Schema + FTS5 BM25 + triggers
     db.run(`
@@ -230,22 +214,6 @@ export async function createAgentMemory(config) {
     function close() {
         db.close();
     }
-    /**
-     * Returns a function that determines whether content should become a memory.
-     *
-     * Uses dual-prototype gap scoring: computes max cosine similarity to
-     * "memorable" prototypes minus max cosine similarity to "throwaway" prototypes.
-     * Content is memorable only if the gap exceeds the threshold AND no similar
-     * memory already exists (novelty check).
-     *
-     * Tuned on 209 diverse examples (97 positive, 112 negative):
-     *   F1=0.757, Accuracy=79.4%, Precision=0.84, Recall=0.69
-     *   gapThreshold: 0.009
-     *   noveltyThreshold: 0.87
-     *
-     * For higher recall (catch more, tolerate more noise):  gapThreshold = -0.018
-     * For higher precision (less noise, miss more):         gapThreshold = 0.025
-     */
     async function shouldCreateMemory(gapThreshold = 0.009, noveltyThreshold = 0.87) {
         await initPrototypes();
         return async (content) => {
@@ -269,7 +237,7 @@ export async function createAgentMemory(config) {
         shouldCreateMemory
     };
 }
-// Tuning dataset
+// Tuning dataset (unchanged)
 export const tuningExamples = [
     { content: "User explicitly hates modal popups and prefers dark mode always", shouldMemorize: true },
     { content: "The sky is blue today", shouldMemorize: false },

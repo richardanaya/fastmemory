@@ -42,24 +42,7 @@ async function createDatabase(dbPath: string): Promise<DatabaseAdapter> {
       close: () => db.close()
     };
   } else {
-    const Database = (await import('better-sqlite3')).default;
-    const db = new Database(dbPath);
-    db.pragma('journal_mode = WAL');
-   
-    return {
-      run: (sql: string, params?: any[]) => {
-        const stmt = db.prepare(sql);
-        return params ? stmt.run(...params) : stmt.run();
-      },
-      query: (sql: string) => {
-        const stmt = db.prepare(sql);
-        return {
-          all: (...params: any[]) => stmt.all(...params),
-          get: (...params: any[]) => stmt.get(...params)
-        };
-      },
-      close: () => db.close()
-    };
+    throw new Error('fastmemory requires Bun. Node.js is not supported.');
   }
 }
 
