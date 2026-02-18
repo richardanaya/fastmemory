@@ -1,5 +1,4 @@
 import { randomUUID } from 'crypto';
-import { pipeline } from '@xenova/transformers';
 
 export interface MemoryEntry {
   id: string;
@@ -50,6 +49,10 @@ let extractor: any = null;
 
 async function initEmbedder(cacheDir?: string) {
   if (extractor) return extractor;
+
+  // Dynamic import defers loading @xenova/transformers (and its heavy ONNX
+  // runtime) until the embedder is actually needed, rather than at module load.
+  const { pipeline } = await import('@xenova/transformers');
 
   const options: any = {
     quantized: true,

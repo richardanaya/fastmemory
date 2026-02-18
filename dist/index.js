@@ -1,5 +1,4 @@
 import { randomUUID } from 'crypto';
-import { pipeline } from '@xenova/transformers';
 async function createDatabase(dbPath) {
     const isBun = typeof Bun !== 'undefined';
     if (isBun) {
@@ -27,6 +26,9 @@ let extractor = null;
 async function initEmbedder(cacheDir) {
     if (extractor)
         return extractor;
+    // Dynamic import defers loading @xenova/transformers (and its heavy ONNX
+    // runtime) until the embedder is actually needed, rather than at module load.
+    const { pipeline } = await import('@xenova/transformers');
     const options = {
         quantized: true,
         progress_callback: null,
