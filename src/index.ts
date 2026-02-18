@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { FlagEmbedding, EmbeddingModel } from 'fastembed';
+import { pipeline } from '@xenova/transformers';
 
 export interface MemoryEntry {
   id: string;
@@ -11,25 +11,24 @@ export interface MemoryEntry {
 
 export interface AgentMemoryConfig {
   dbPath: string;
-  cacheDir?: string;        // ← NEW: Optional path for fastembed model cache (prevents local_cache pollution)
+  cacheDir?: string;        // ← controls where the embedding model is stored
 }
 
-// Database adapter interface
+// Database adapter (Bun + Node.js)
 interface DatabaseAdapter {
   run(sql: string, params?: any[]): void;
   query(sql: string): { all(...params: any[]): any[]; get(...params: any[]): any };
   close(): void;
 }
 
-// Detect runtime and load appropriate SQLite implementation
 async function createDatabase(dbPath: string): Promise<DatabaseAdapter> {
   const isBun = typeof Bun !== 'undefined';
- 
+
   if (isBun) {
     const { Database } = await import('bun:sqlite');
     const db = new Database(dbPath, { create: true, readwrite: true });
     db.run('PRAGMA journal_mode = WAL');
-   
+
     return {
       run: (sql: string, params?: any[]) => db.run(sql, params || []),
       query: (sql: string) => {
@@ -46,31 +45,23 @@ async function createDatabase(dbPath: string): Promise<DatabaseAdapter> {
   }
 }
 
-// ── Fastembed with cacheDir support ──
-let embedder: FlagEmbedding | null = null;
-let initializedCacheDir: string | null = null;
+// ── Xenova WASM Embedder ──
+let extractor: any = null;
 
 async function initEmbedder(cacheDir?: string) {
-  if (embedder) {
-    if (cacheDir && initializedCacheDir && cacheDir !== initializedCacheDir) {
-      console.warn(`[fastmemory] cacheDir changed after initialization. Using original: ${initializedCacheDir}`);
-    }
-    return;
-  }
+  if (extractor) return extractor;
 
   const options: any = {
-    model: EmbeddingModel.BGEBaseENV15,
+    quantized: true,
+    progress_callback: null,
   };
+  if (cacheDir) options.cache_dir = cacheDir;
 
-  if (cacheDir) {
-    options.cacheDir = cacheDir;
-    initializedCacheDir = cacheDir;
-  }
-
-  embedder = await FlagEmbedding.init(options);
+  extractor = await pipeline('feature-extraction', 'Xenova/bge-base-en-v1.5', options);
+  return extractor;
 }
 
-// --- Dual-prototype memory judge --- (unchanged)
+// ── Dual-prototype judge (unchanged) ──
 const POSITIVE_PROTOTYPES = [
   "user permanently prefers specific tools languages frameworks themes and hates specific alternatives for all future work",
   "user personal identity: name birthday allergy disability pronouns timezone contact email credential",
@@ -81,6 +72,7 @@ const POSITIVE_PROTOTYPES = [
   "user's personal work schedule availability and accessibility needs that affect every interaction",
   "user casually mentioned a permanent personal fact: language fluency work hours disability diet"
 ];
+
 const NEGATIVE_PROTOTYPES = [
   "casual chat: greetings thanks acknowledgments reactions feelings okay sounds good",
   "ephemeral event happening right now: build failing deploying fixing pushing committing running tests",
@@ -100,15 +92,18 @@ let negProtoEmbs: number[][] | null = null;
 
 async function initPrototypes() {
   if (posProtoEmbs) return;
+  const emb = await initEmbedder();
+
   posProtoEmbs = [];
   for (const proto of POSITIVE_PROTOTYPES) {
-    const embs = embedder!.passageEmbed([proto]);
-    for await (const batch of embs) { posProtoEmbs.push(batch[0]); break; }
+    const output = await emb(proto, { pooling: 'mean', normalize: true });
+    posProtoEmbs.push(Array.from(output.data) as number[]);
   }
+
   negProtoEmbs = [];
   for (const proto of NEGATIVE_PROTOTYPES) {
-    const embs = embedder!.passageEmbed([proto]);
-    for await (const batch of embs) { negProtoEmbs.push(batch[0]); break; }
+    const output = await emb(proto, { pooling: 'mean', normalize: true });
+    negProtoEmbs.push(Array.from(output.data) as number[]);
   }
 }
 
@@ -124,19 +119,22 @@ function cosineSim(a: number[], b: number[]): number {
 
 async function getImportanceGap(content: string): Promise<number> {
   await initPrototypes();
-  const qEmb = await embedder!.queryEmbed(content);
+  const emb = await initEmbedder();
+  const output = await emb(content, { pooling: 'mean', normalize: true });
+  const qEmb = Array.from(output.data) as number[];
+
   const posSim = Math.max(...posProtoEmbs!.map(p => cosineSim(qEmb, p)));
   const negSims = negProtoEmbs!.map(p => cosineSim(qEmb, p)).sort((a, b) => b - a);
   const avgTop2Neg = (negSims[0] + negSims[1]) / 2;
   return posSim - avgTop2Neg;
 }
 
+// ── Main API ──
 export async function createAgentMemory(config: AgentMemoryConfig) {
-  await initEmbedder(config.cacheDir);   // ← Now respects cacheDir
+  await initEmbedder(config.cacheDir);
 
   const db = await createDatabase(config.dbPath);
 
-  // Schema + FTS5 BM25 + triggers
   db.run(`
     CREATE TABLE IF NOT EXISTS memories (
       id TEXT PRIMARY KEY,
@@ -146,22 +144,26 @@ export async function createAgentMemory(config: AgentMemoryConfig) {
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
   `);
+
   db.run(`
     CREATE VIRTUAL TABLE IF NOT EXISTS fts_memories USING fts5(
       content,
       id UNINDEXED
     );
   `);
+
   db.run(`
     CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
       INSERT INTO fts_memories (id, content) VALUES (new.id, new.content);
     END;
   `);
+
   db.run(`
     CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
       DELETE FROM fts_memories WHERE id = old.id;
     END;
   `);
+
   db.run(`
     CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
       DELETE FROM fts_memories WHERE id = old.id;
@@ -181,16 +183,10 @@ export async function createAgentMemory(config: AgentMemoryConfig) {
 
   async function add(content: string, metadata: Record<string, any> = {}) {
     const id = randomUUID();
-    const embeddings = embedder!.passageEmbed([content]);
-    let embedding: number[] | undefined;
-    for await (const batch of embeddings) {
-      embedding = batch[0];
-      break;
-    }
-   
-    if (!embedding) {
-      throw new Error('Failed to generate embedding');
-    }
+    const emb = await initEmbedder();
+    const output = await emb(content, { pooling: 'mean', normalize: true });
+    const embedding = Array.from(output.data) as number[];
+
     db.run(
       `INSERT INTO memories (id, content, metadata, embedding, created_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)`,
       [id, content, JSON.stringify(metadata), JSON.stringify(embedding)]
@@ -212,27 +208,35 @@ export async function createAgentMemory(config: AgentMemoryConfig) {
   }
 
   async function searchVector(query: string, limit = 10): Promise<MemoryEntry[]> {
-    const qEmb = await embedder!.queryEmbed(query);
+    const emb = await initEmbedder();
+    const output = await emb(query, { pooling: 'mean', normalize: true });
+    const qEmb = Array.from(output.data) as number[];
+
     const stmt = db.query('SELECT * FROM memories');
     const rows = stmt.all();
+
     const scored = rows
       .map(row => {
-        const emb = row.embedding ? JSON.parse(row.embedding) : null;
-        if (!emb) return { ...hydrate(row), score: 0 };
-        return { ...hydrate(row), score: cosineSim(qEmb, emb) };
+        const embData = row.embedding ? JSON.parse(row.embedding) : null;
+        if (!embData) return { ...hydrate(row), score: 0 };
+        return { ...hydrate(row), score: cosineSim(qEmb, embData as number[]) };
       })
       .sort((a, b) => (b.score || 0) - (a.score || 0))
       .slice(0, limit);
+
     return scored;
   }
 
   async function searchHybrid(query: string, limit = 10): Promise<MemoryEntry[]> {
     const bm25s = searchBM25(query, 30);
     const vecs = await searchVector(query, 30);
+
     const k = 60;
     const scores = new Map<string, number>();
+
     bm25s.forEach((r, i) => scores.set(r.id, (scores.get(r.id) || 0) + 1 / (k + i)));
     vecs.forEach((r, i) => scores.set(r.id, (scores.get(r.id) || 0) + 1 / (k + i)));
+
     const merged = [...new Set([...bm25s, ...vecs].map(r => r.id))]
       .map(id => {
         const item = bm25s.find(r => r.id === id) || vecs.find(r => r.id === id)!;
@@ -240,6 +244,7 @@ export async function createAgentMemory(config: AgentMemoryConfig) {
       })
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);
+
     return merged;
   }
 

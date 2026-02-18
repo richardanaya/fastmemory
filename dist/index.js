@@ -1,6 +1,5 @@
 import { randomUUID } from 'crypto';
-import { FlagEmbedding, EmbeddingModel } from 'fastembed';
-// Detect runtime and load appropriate SQLite implementation
+import { pipeline } from '@xenova/transformers';
 async function createDatabase(dbPath) {
     const isBun = typeof Bun !== 'undefined';
     if (isBun) {
@@ -23,26 +22,21 @@ async function createDatabase(dbPath) {
         throw new Error('fastmemory requires Bun. Node.js is not supported.');
     }
 }
-// ── Fastembed with cacheDir support ──
-let embedder = null;
-let initializedCacheDir = null;
+// ── Xenova WASM Embedder ──
+let extractor = null;
 async function initEmbedder(cacheDir) {
-    if (embedder) {
-        if (cacheDir && initializedCacheDir && cacheDir !== initializedCacheDir) {
-            console.warn(`[fastmemory] cacheDir changed after initialization. Using original: ${initializedCacheDir}`);
-        }
-        return;
-    }
+    if (extractor)
+        return extractor;
     const options = {
-        model: EmbeddingModel.BGEBaseENV15,
+        quantized: true,
+        progress_callback: null,
     };
-    if (cacheDir) {
-        options.cacheDir = cacheDir;
-        initializedCacheDir = cacheDir;
-    }
-    embedder = await FlagEmbedding.init(options);
+    if (cacheDir)
+        options.cache_dir = cacheDir;
+    extractor = await pipeline('feature-extraction', 'Xenova/bge-base-en-v1.5', options);
+    return extractor;
 }
-// --- Dual-prototype memory judge --- (unchanged)
+// ── Dual-prototype judge (unchanged) ──
 const POSITIVE_PROTOTYPES = [
     "user permanently prefers specific tools languages frameworks themes and hates specific alternatives for all future work",
     "user personal identity: name birthday allergy disability pronouns timezone contact email credential",
@@ -71,21 +65,16 @@ let negProtoEmbs = null;
 async function initPrototypes() {
     if (posProtoEmbs)
         return;
+    const emb = await initEmbedder();
     posProtoEmbs = [];
     for (const proto of POSITIVE_PROTOTYPES) {
-        const embs = embedder.passageEmbed([proto]);
-        for await (const batch of embs) {
-            posProtoEmbs.push(batch[0]);
-            break;
-        }
+        const output = await emb(proto, { pooling: 'mean', normalize: true });
+        posProtoEmbs.push(Array.from(output.data));
     }
     negProtoEmbs = [];
     for (const proto of NEGATIVE_PROTOTYPES) {
-        const embs = embedder.passageEmbed([proto]);
-        for await (const batch of embs) {
-            negProtoEmbs.push(batch[0]);
-            break;
-        }
+        const output = await emb(proto, { pooling: 'mean', normalize: true });
+        negProtoEmbs.push(Array.from(output.data));
     }
 }
 function cosineSim(a, b) {
@@ -99,16 +88,18 @@ function cosineSim(a, b) {
 }
 async function getImportanceGap(content) {
     await initPrototypes();
-    const qEmb = await embedder.queryEmbed(content);
+    const emb = await initEmbedder();
+    const output = await emb(content, { pooling: 'mean', normalize: true });
+    const qEmb = Array.from(output.data);
     const posSim = Math.max(...posProtoEmbs.map(p => cosineSim(qEmb, p)));
     const negSims = negProtoEmbs.map(p => cosineSim(qEmb, p)).sort((a, b) => b - a);
     const avgTop2Neg = (negSims[0] + negSims[1]) / 2;
     return posSim - avgTop2Neg;
 }
+// ── Main API ──
 export async function createAgentMemory(config) {
-    await initEmbedder(config.cacheDir); // ← Now respects cacheDir
+    await initEmbedder(config.cacheDir);
     const db = await createDatabase(config.dbPath);
-    // Schema + FTS5 BM25 + triggers
     db.run(`
     CREATE TABLE IF NOT EXISTS memories (
       id TEXT PRIMARY KEY,
@@ -151,15 +142,9 @@ export async function createAgentMemory(config) {
     }
     async function add(content, metadata = {}) {
         const id = randomUUID();
-        const embeddings = embedder.passageEmbed([content]);
-        let embedding;
-        for await (const batch of embeddings) {
-            embedding = batch[0];
-            break;
-        }
-        if (!embedding) {
-            throw new Error('Failed to generate embedding');
-        }
+        const emb = await initEmbedder();
+        const output = await emb(content, { pooling: 'mean', normalize: true });
+        const embedding = Array.from(output.data);
         db.run(`INSERT INTO memories (id, content, metadata, embedding, created_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)`, [id, content, JSON.stringify(metadata), JSON.stringify(embedding)]);
         return id;
     }
@@ -176,15 +161,17 @@ export async function createAgentMemory(config) {
         return rows.map(hydrate);
     }
     async function searchVector(query, limit = 10) {
-        const qEmb = await embedder.queryEmbed(query);
+        const emb = await initEmbedder();
+        const output = await emb(query, { pooling: 'mean', normalize: true });
+        const qEmb = Array.from(output.data);
         const stmt = db.query('SELECT * FROM memories');
         const rows = stmt.all();
         const scored = rows
             .map(row => {
-            const emb = row.embedding ? JSON.parse(row.embedding) : null;
-            if (!emb)
+            const embData = row.embedding ? JSON.parse(row.embedding) : null;
+            if (!embData)
                 return { ...hydrate(row), score: 0 };
-            return { ...hydrate(row), score: cosineSim(qEmb, emb) };
+            return { ...hydrate(row), score: cosineSim(qEmb, embData) };
         })
             .sort((a, b) => (b.score || 0) - (a.score || 0))
             .slice(0, limit);

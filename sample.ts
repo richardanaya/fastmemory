@@ -1,4 +1,4 @@
-import { createAgentMemory, tuningExamples } from './agent-memory';
+import { createAgentMemory, tuningExamples } from './src/index.js';
 
 async function runDemo() {
   console.log('=== Agent Memory Demo ===\n');
