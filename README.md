@@ -86,14 +86,10 @@ See [MEMORY_RESEARCH.md](./MEMORY_RESEARCH.md) for the full technical deep-dive.
 
 ## Installation
 
-Works with Bun (recommended, native SQLite) or Node.js:
+Requires Bun:
 
 ```bash
-# Bun (recommended, faster)
 bun add fastmemory
-
-# Node.js
-npm install fastmemory
 ```
 
 ## Quick Start
@@ -375,4 +371,4 @@ MIT. Full source, zero dependencies on external APIs.
 
 ---
 
-**Built with:** Bun, Node.js, fastembed, better ideas than LangChain.
+**Built with:** Bun, @xenova/transformers.
