@@ -1,6 +1,6 @@
 {
   "name": "fastmemory",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Zero-cost local semantic memory for AI agents with hybrid search and dual-prototype importance detection",
   "keywords": [
     "memory",

@@ -157,6 +157,15 @@ const shouldMemorize = await store.shouldCreateMemory(
 );
 ```
 
+**Custom cache directory:**
+```typescript
+// Set custom cache path for the embedding model (prevents local_cache pollution)
+const store = await createAgentMemory({ 
+  dbPath: './memory.db',
+  cacheDir: './models/embeddings' 
+});
+```
+
 **Tuning the threshold:**
 - **Lower threshold** (e.g., -0.018): Catch more memories, tolerate more noise (higher recall)
 - **Higher threshold** (e.g., 0.025): Less noise, miss more memories (higher precision)

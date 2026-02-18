@@ -11,6 +11,7 @@ export interface MemoryEntry {
 
 export interface AgentMemoryConfig {
   dbPath: string;
+  cacheDir?: string;        // ← NEW: Optional path for fastembed model cache (prevents local_cache pollution)
 }
 
 // Database adapter interface
@@ -23,13 +24,12 @@ interface DatabaseAdapter {
 // Detect runtime and load appropriate SQLite implementation
 async function createDatabase(dbPath: string): Promise<DatabaseAdapter> {
   const isBun = typeof Bun !== 'undefined';
-  
+ 
   if (isBun) {
-    // Use Bun's native SQLite
     const { Database } = await import('bun:sqlite');
     const db = new Database(dbPath, { create: true, readwrite: true });
     db.run('PRAGMA journal_mode = WAL');
-    
+   
     return {
       run: (sql: string, params?: any[]) => db.run(sql, params || []),
       query: (sql: string) => {
@@ -42,11 +42,10 @@ async function createDatabase(dbPath: string): Promise<DatabaseAdapter> {
       close: () => db.close()
     };
   } else {
-    // Use better-sqlite3 for Node.js
     const Database = (await import('better-sqlite3')).default;
     const db = new Database(dbPath);
     db.pragma('journal_mode = WAL');
-    
+   
     return {
       run: (sql: string, params?: any[]) => {
         const stmt = db.prepare(sql);
@@ -64,18 +63,31 @@ async function createDatabase(dbPath: string): Promise<DatabaseAdapter> {
   }
 }
 
-let embedder: FlagEmbedding;
+// ── Fastembed with cacheDir support ──
+let embedder: FlagEmbedding | null = null;
+let initializedCacheDir: string | null = null;
 
-async function initEmbedder() {
-  if (!embedder) {
-    embedder = await FlagEmbedding.init({
-      model: EmbeddingModel.BGEBaseENV15,
-    });
+async function initEmbedder(cacheDir?: string) {
+  if (embedder) {
+    if (cacheDir && initializedCacheDir && cacheDir !== initializedCacheDir) {
+      console.warn(`[fastmemory] cacheDir changed after initialization. Using original: ${initializedCacheDir}`);
+    }
+    return;
   }
+
+  const options: any = {
+    model: EmbeddingModel.BGEBaseENV15,
+  };
+
+  if (cacheDir) {
+    options.cacheDir = cacheDir;
+    initializedCacheDir = cacheDir;
+  }
+
+  embedder = await FlagEmbedding.init(options);
 }
 
-// --- Dual-prototype memory judge ---
-
+// --- Dual-prototype memory judge --- (unchanged)
 const POSITIVE_PROTOTYPES = [
   "user permanently prefers specific tools languages frameworks themes and hates specific alternatives for all future work",
   "user personal identity: name birthday allergy disability pronouns timezone contact email credential",
@@ -86,7 +98,6 @@ const POSITIVE_PROTOTYPES = [
   "user's personal work schedule availability and accessibility needs that affect every interaction",
   "user casually mentioned a permanent personal fact: language fluency work hours disability diet"
 ];
-
 const NEGATIVE_PROTOTYPES = [
   "casual chat: greetings thanks acknowledgments reactions feelings okay sounds good",
   "ephemeral event happening right now: build failing deploying fixing pushing committing running tests",
@@ -106,16 +117,14 @@ let negProtoEmbs: number[][] | null = null;
 
 async function initPrototypes() {
   if (posProtoEmbs) return;
-
   posProtoEmbs = [];
   for (const proto of POSITIVE_PROTOTYPES) {
-    const embs = embedder.passageEmbed([proto]);
+    const embs = embedder!.passageEmbed([proto]);
     for await (const batch of embs) { posProtoEmbs.push(batch[0]); break; }
   }
-
   negProtoEmbs = [];
   for (const proto of NEGATIVE_PROTOTYPES) {
-    const embs = embedder.passageEmbed([proto]);
+    const embs = embedder!.passageEmbed([proto]);
     for await (const batch of embs) { negProtoEmbs.push(batch[0]); break; }
   }
 }
@@ -130,29 +139,18 @@ function cosineSim(a: number[], b: number[]): number {
   return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1);
 }
 
-/**
- * Computes the importance gap: max similarity to positive prototypes
- * minus average of top-2 negative prototype similarities.
- *
- * Using avg top-2 neg instead of max neg improves precision (fewer false
- * positives) because a single high neg match can be an outlier -- averaging
- * the top 2 gives a more stable estimate of "throwaway-ness".
- */
 async function getImportanceGap(content: string): Promise<number> {
   await initPrototypes();
-  const qEmb = await embedder.queryEmbed(content);
-
+  const qEmb = await embedder!.queryEmbed(content);
   const posSim = Math.max(...posProtoEmbs!.map(p => cosineSim(qEmb, p)));
   const negSims = negProtoEmbs!.map(p => cosineSim(qEmb, p)).sort((a, b) => b - a);
   const avgTop2Neg = (negSims[0] + negSims[1]) / 2;
-
   return posSim - avgTop2Neg;
 }
 
 export async function createAgentMemory(config: AgentMemoryConfig) {
-  await initEmbedder();
+  await initEmbedder(config.cacheDir);   // ← Now respects cacheDir
 
-  // Create database using appropriate adapter (Bun or Node.js)
   const db = await createDatabase(config.dbPath);
 
   // Schema + FTS5 BM25 + triggers
@@ -165,26 +163,22 @@ export async function createAgentMemory(config: AgentMemoryConfig) {
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
   `);
-
   db.run(`
     CREATE VIRTUAL TABLE IF NOT EXISTS fts_memories USING fts5(
       content,
       id UNINDEXED
     );
   `);
-
   db.run(`
     CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
       INSERT INTO fts_memories (id, content) VALUES (new.id, new.content);
     END;
   `);
-
   db.run(`
     CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
       DELETE FROM fts_memories WHERE id = old.id;
     END;
   `);
-
   db.run(`
     CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
       DELETE FROM fts_memories WHERE id = old.id;
@@ -204,22 +198,20 @@ export async function createAgentMemory(config: AgentMemoryConfig) {
 
   async function add(content: string, metadata: Record<string, any> = {}) {
     const id = randomUUID();
-    const embeddings = embedder.passageEmbed([content]);
+    const embeddings = embedder!.passageEmbed([content]);
     let embedding: number[] | undefined;
     for await (const batch of embeddings) {
       embedding = batch[0];
       break;
     }
-    
+   
     if (!embedding) {
       throw new Error('Failed to generate embedding');
     }
-
     db.run(
       `INSERT INTO memories (id, content, metadata, embedding, created_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)`,
       [id, content, JSON.stringify(metadata), JSON.stringify(embedding)]
     );
-
     return id;
   }
 
@@ -237,11 +229,9 @@ export async function createAgentMemory(config: AgentMemoryConfig) {
   }
 
   async function searchVector(query: string, limit = 10): Promise<MemoryEntry[]> {
-    const qEmb = await embedder.queryEmbed(query);
-
+    const qEmb = await embedder!.queryEmbed(query);
     const stmt = db.query('SELECT * FROM memories');
     const rows = stmt.all();
-
     const scored = rows
       .map(row => {
         const emb = row.embedding ? JSON.parse(row.embedding) : null;
@@ -250,20 +240,16 @@ export async function createAgentMemory(config: AgentMemoryConfig) {
       })
       .sort((a, b) => (b.score || 0) - (a.score || 0))
       .slice(0, limit);
-
     return scored;
   }
 
   async function searchHybrid(query: string, limit = 10): Promise<MemoryEntry[]> {
     const bm25s = searchBM25(query, 30);
     const vecs = await searchVector(query, 30);
-
     const k = 60;
     const scores = new Map<string, number>();
-
     bm25s.forEach((r, i) => scores.set(r.id, (scores.get(r.id) || 0) + 1 / (k + i)));
     vecs.forEach((r, i) => scores.set(r.id, (scores.get(r.id) || 0) + 1 / (k + i)));
-
     const merged = [...new Set([...bm25s, ...vecs].map(r => r.id))]
       .map(id => {
         const item = bm25s.find(r => r.id === id) || vecs.find(r => r.id === id)!;
@@ -271,7 +257,6 @@ export async function createAgentMemory(config: AgentMemoryConfig) {
       })
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);
-
     return merged;
   }
 
@@ -285,37 +270,17 @@ export async function createAgentMemory(config: AgentMemoryConfig) {
     db.close();
   }
 
-  /**
-   * Returns a function that determines whether content should become a memory.
-   *
-   * Uses dual-prototype gap scoring: computes max cosine similarity to
-   * "memorable" prototypes minus max cosine similarity to "throwaway" prototypes.
-   * Content is memorable only if the gap exceeds the threshold AND no similar
-   * memory already exists (novelty check).
-   *
-   * Tuned on 209 diverse examples (97 positive, 112 negative):
-   *   F1=0.757, Accuracy=79.4%, Precision=0.84, Recall=0.69
-   *   gapThreshold: 0.009
-   *   noveltyThreshold: 0.87
-   *
-   * For higher recall (catch more, tolerate more noise):  gapThreshold = -0.018
-   * For higher precision (less noise, miss more):         gapThreshold = 0.025
-   */
   async function shouldCreateMemory(
     gapThreshold = 0.009,
     noveltyThreshold = 0.87
   ): Promise<(content: string) => Promise<boolean>> {
     await initPrototypes();
-
     return async (content: string): Promise<boolean> => {
       if (content.length < 20 || content.length > 800) return false;
-
       const gap = await getImportanceGap(content);
       if (gap < gapThreshold) return false;
-
       const similars = await searchVector(content, 1);
       const maxSim = similars[0]?.score ?? 0;
-
       return maxSim < noveltyThreshold;
     };
   }
@@ -331,7 +296,7 @@ export async function createAgentMemory(config: AgentMemoryConfig) {
   };
 }
 
-// Tuning dataset
+// Tuning dataset (unchanged)
 export const tuningExamples = [
   { content: "User explicitly hates modal popups and prefers dark mode always", shouldMemorize: true },
   { content: "The sky is blue today", shouldMemorize: false },
