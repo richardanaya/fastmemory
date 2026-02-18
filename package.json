@@ -1,0 +1,60 @@
+{
+  "name": "fastmemory",
+  "version": "0.1.0",
+  "description": "Zero-cost local semantic memory for AI agents with hybrid search and dual-prototype importance detection",
+  "keywords": [
+    "memory",
+    "agent",
+    "ai",
+    "embeddings",
+    "sqlite",
+    "semantic-search",
+    "bm25",
+    "fastembed",
+    "local-first"
+  ],
+  "homepage": "https://github.com/richardanaya/fastmemory",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/richardanaya/fastmemory.git"
+  },
+  "bugs": {
+    "url": "https://github.com/richardanaya/fastmemory/issues"
+  },
+  "license": "MIT",
+  "author": "Richard Anaya",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "fastembed": "^2.1.0"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^11.0.0"
+  },
+  "files": [
+    "dist",
+    "MEMORY_RESEARCH.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node test-runtime.mjs && bun test-runtime.mjs"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/bun": "^1.3.9",
+    "@types/node": "^25.2.3",
+    "typescript": "^5.9.3"
+  }
+}
