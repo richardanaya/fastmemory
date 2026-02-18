@@ -8,6 +8,8 @@ export interface MemoryEntry {
 export interface AgentMemoryConfig {
     dbPath: string;
     cacheDir?: string;
+    device?: 'cpu' | 'webgpu' | 'auto';
+    dtype?: 'fp32' | 'fp16' | 'q8' | 'q4';
 }
 export declare function createAgentMemory(config: AgentMemoryConfig): Promise<{
     add: (content: string, metadata?: Record<string, any>) => Promise<`${string}-${string}-${string}-${string}-${string}`>;

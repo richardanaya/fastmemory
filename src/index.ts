@@ -11,6 +11,8 @@ export interface MemoryEntry {
 export interface AgentMemoryConfig {
   dbPath: string;
   cacheDir?: string;        // ← controls where the embedding model is stored
+  device?: 'cpu' | 'webgpu' | 'auto';  // ← device preference for embeddings
+  dtype?: 'fp32' | 'fp16' | 'q8' | 'q4';  // ← quantization for speed/memory
 }
 
 // Database adapter (Bun + Node.js)
@@ -44,23 +46,31 @@ async function createDatabase(dbPath: string): Promise<DatabaseAdapter> {
   }
 }
 
-// ── Xenova WASM Embedder ──
+// ── HuggingFace Transformers Embedder (CPU mode) ──
 let extractor: any = null;
+let deviceConfig: { device: string; dtype: string } = { device: 'cpu', dtype: 'q4' };
 
-async function initEmbedder(cacheDir?: string) {
+async function initEmbedder(config?: AgentMemoryConfig) {
   if (extractor) return extractor;
 
-  // Dynamic import defers loading @xenova/transformers (and its heavy ONNX
-  // runtime) until the embedder is actually needed, rather than at module load.
-  const { pipeline } = await import('@xenova/transformers');
+  // Dynamic import defers loading @huggingface/transformers until needed
+  const { pipeline } = await import('@huggingface/transformers');
+  
+  // CPU mode only for Bun compatibility
+  const dtype = config?.dtype || 'q4';
+  deviceConfig = { device: 'cpu', dtype };
 
   const options: any = {
-    quantized: true,
-    progress_callback: null,
+    device: 'cpu',
+    dtype,
   };
-  if (cacheDir) options.cache_dir = cacheDir;
+  if (config?.cacheDir) options.cache_dir = config.cacheDir;
 
-  extractor = await pipeline('feature-extraction', 'Xenova/bge-base-en-v1.5', options);
+  extractor = await pipeline(
+    'feature-extraction',
+    'onnx-community/embeddinggemma-300m-ONNX',
+    options
+  );
   return extractor;
 }
 
@@ -100,13 +110,13 @@ async function initPrototypes() {
   posProtoEmbs = [];
   for (const proto of POSITIVE_PROTOTYPES) {
     const output = await emb(proto, { pooling: 'mean', normalize: true });
-    posProtoEmbs.push(Array.from(output.data) as number[]);
+    posProtoEmbs.push(output.tolist()[0] as number[]);
   }
 
   negProtoEmbs = [];
   for (const proto of NEGATIVE_PROTOTYPES) {
     const output = await emb(proto, { pooling: 'mean', normalize: true });
-    negProtoEmbs.push(Array.from(output.data) as number[]);
+    negProtoEmbs.push(output.tolist()[0] as number[]);
   }
 }
 
@@ -124,7 +134,7 @@ async function getImportanceGap(content: string): Promise<number> {
   await initPrototypes();
   const emb = await initEmbedder();
   const output = await emb(content, { pooling: 'mean', normalize: true });
-  const qEmb = Array.from(output.data) as number[];
+  const qEmb = output.tolist()[0] as number[];
 
   const posSim = Math.max(...posProtoEmbs!.map(p => cosineSim(qEmb, p)));
   const negSims = negProtoEmbs!.map(p => cosineSim(qEmb, p)).sort((a, b) => b - a);
@@ -134,7 +144,7 @@ async function getImportanceGap(content: string): Promise<number> {
 
 // ── Main API ──
 export async function createAgentMemory(config: AgentMemoryConfig) {
-  await initEmbedder(config.cacheDir);
+  await initEmbedder(config);
 
   const db = await createDatabase(config.dbPath);
 
@@ -188,7 +198,7 @@ export async function createAgentMemory(config: AgentMemoryConfig) {
     const id = randomUUID();
     const emb = await initEmbedder();
     const output = await emb(content, { pooling: 'mean', normalize: true });
-    const embedding = Array.from(output.data) as number[];
+    const embedding = output.tolist()[0] as number[];
 
     db.run(
       `INSERT INTO memories (id, content, metadata, embedding, created_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)`,
@@ -213,7 +223,7 @@ export async function createAgentMemory(config: AgentMemoryConfig) {
   async function searchVector(query: string, limit = 10): Promise<MemoryEntry[]> {
     const emb = await initEmbedder();
     const output = await emb(query, { pooling: 'mean', normalize: true });
-    const qEmb = Array.from(output.data) as number[];
+    const qEmb = output.tolist()[0] as number[];
 
     const stmt = db.query('SELECT * FROM memories');
     const rows = stmt.all();
