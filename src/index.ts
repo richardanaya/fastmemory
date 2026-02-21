@@ -15,7 +15,7 @@ export interface AgentMemoryConfig {
   dtype?: 'fp32' | 'fp16' | 'q8' | 'q4';  // ← quantization for speed/memory
 }
 
-// Database adapter (Bun + Node.js)
+// Database adapter (Node.js with better-sqlite3)
 interface DatabaseAdapter {
   run(sql: string, params?: any[]): void;
   query(sql: string): { all(...params: any[]): any[]; get(...params: any[]): any };
@@ -23,27 +23,22 @@ interface DatabaseAdapter {
 }
 
 async function createDatabase(dbPath: string): Promise<DatabaseAdapter> {
-  const isBun = typeof Bun !== 'undefined';
+  // Using better-sqlite3 for synchronous SQLite operations in Node.js
+  const { default: Database } = await import('better-sqlite3');
+  const db = new Database(dbPath);
+  db.pragma('journal_mode = WAL');
 
-  if (isBun) {
-    const { Database } = await import('bun:sqlite');
-    const db = new Database(dbPath, { create: true, readwrite: true });
-    db.run('PRAGMA journal_mode = WAL');
-
-    return {
-      run: (sql: string, params?: any[]) => db.run(sql, params || []),
-      query: (sql: string) => {
-        const stmt = db.query(sql);
-        return {
-          all: (...params: any[]) => stmt.all(...params),
-          get: (...params: any[]) => stmt.get(...params)
-        };
-      },
-      close: () => db.close()
-    };
-  } else {
-    throw new Error('fastmemory requires Bun. Node.js is not supported.');
-  }
+  return {
+    run: (sql: string, params?: any[]) => db.prepare(sql).run(params || []),
+    query: (sql: string) => {
+      const stmt = db.prepare(sql);
+      return {
+        all: (...params: any[]) => stmt.all(...params),
+        get: (...params: any[]) => stmt.get(...params)
+      };
+    },
+    close: () => db.close()
+  };
 }
 
 // ── HuggingFace Transformers Embedder (CPU mode) ──

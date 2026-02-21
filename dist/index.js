@@ -1,25 +1,20 @@
 import { randomUUID } from 'crypto';
 async function createDatabase(dbPath) {
-    const isBun = typeof Bun !== 'undefined';
-    if (isBun) {
-        const { Database } = await import('bun:sqlite');
-        const db = new Database(dbPath, { create: true, readwrite: true });
-        db.run('PRAGMA journal_mode = WAL');
-        return {
-            run: (sql, params) => db.run(sql, params || []),
-            query: (sql) => {
-                const stmt = db.query(sql);
-                return {
-                    all: (...params) => stmt.all(...params),
-                    get: (...params) => stmt.get(...params)
-                };
-            },
-            close: () => db.close()
-        };
-    }
-    else {
-        throw new Error('fastmemory requires Bun. Node.js is not supported.');
-    }
+    // Using better-sqlite3 for synchronous SQLite operations in Node.js
+    const { default: Database } = await import('better-sqlite3');
+    const db = new Database(dbPath);
+    db.pragma('journal_mode = WAL');
+    return {
+        run: (sql, params) => db.prepare(sql).run(params || []),
+        query: (sql) => {
+            const stmt = db.prepare(sql);
+            return {
+                all: (...params) => stmt.all(...params),
+                get: (...params) => stmt.get(...params)
+            };
+        },
+        close: () => db.close()
+    };
 }
 // ── HuggingFace Transformers Embedder (CPU mode) ──
 let extractor = null;
